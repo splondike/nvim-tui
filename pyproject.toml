@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "nvim-tui"
+version = "0.1.0"
+description = ""
+authors = ["Stefan Schneider-Kennedy <code@stefansk.name>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.13"
+pynvim = "^0.5.2"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
