@@ -19,20 +19,8 @@ local function setup_nvim_tui()
 	end)
 end
 
-vim.api.nvim_create_user_command("NvimTuiEnable", setup_nvim_tui, {})
-vim.api.nvim_create_user_command("NvimTuiSendEvent", function(opts)
-	send_nvim_tui_event(opts.fargs[1])
-end, { nargs = 1 })
-vim.api.nvim_create_user_command("NvimTuiSetTargetWindow", function(opts)
-	local window = vim.api.nvim_get_current_win()
-	if opts.fargs[1] ~= nil then
-		window = opts.fargs[1]
-	end
-	vim.rpcnotify(0, "NvimTuiEvent", "SetTargetWindow", window)
-end, { nargs = "?" })
-
 vim.api.nvim_create_augroup("NvimTuiCursorMovedDebounce", { clear = true })
-local debounce_time = 300 -- ms (300 milliseconds)
+local debounce_time = vim.b.NvimTuiDebounceTime or 1 -- ms (1 millisecond)
 local debounce_timer = nil
 local debounce_action = "primary"
 local debounce_target_window = nil
@@ -55,21 +43,41 @@ local function on_cursor_moved()
 	end, debounce_time)
 end
 
-vim.api.nvim_create_user_command("NvimTuiWatchCursorMove", function(opts)
-	debounce_target_window = vim.api.nvim_get_current_win()
-	debounce_target_buffer = vim.api.nvim_get_current_buf()
+local function cmd_completions(arglead, _, _)
+	if arglead:find(" ", 1, true) ~= nil then
+		-- No autocomplete beyond the action
+		return {}
+	end
 
-	if opts.fargs[1] then
-		if cursor_move_autocmd == nil then
+	return { "start", "toggle-watch", "set-target-window" }
+end
+
+vim.api.nvim_create_user_command("NvimTui", function(opts)
+	if opts.fargs[1] == "start" then
+		setup_nvim_tui()
+	elseif opts.fargs[1] == "set-target-window" then
+		local window = vim.api.nvim_get_current_win()
+		if opts.fargs[2] ~= nil then
+			window = opts.fargs[2]
+		end
+		vim.rpcnotify(0, "NvimTuiEvent", "SetTargetWindow", window)
+	elseif opts.fargs[1] == "toggle-watch" then
+		debounce_target_window = vim.api.nvim_get_current_win()
+		debounce_target_buffer = vim.api.nvim_get_current_buf()
+
+		if cursor_move_autocmd ~= nil then
+			vim.api.nvim_del_autocmd(cursor_move_autocmd)
+			cursor_move_autocmd = nil
+		else
+			if opts.fargs[2] then
+				debounce_action = opts.fargs[2]
+			else
+				debounce_action = "primary"
+			end
 			cursor_move_autocmd = vim.api.nvim_create_autocmd("CursorMoved", {
 				group = "NvimTuiCursorMovedDebounce",
 				callback = on_cursor_moved,
 			})
 		end
-		debounce_action = opts.fargs[1]
-	else
-		if cursor_move_autocmd ~= nil then
-			vim.api.nvim_del_autocmd(cursor_move_autocmd)
-		end
 	end
-end, { nargs = "?" })
+end, { nargs = "*", complete = cmd_completions })

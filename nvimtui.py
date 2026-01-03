@@ -2,74 +2,36 @@
 Use NeoVim as a simple TUI with the help of a handler script.
 
 Usage:
-    nvimtui ./handler.sh
+    nvimtui ./handler.py
 
-handler.sh should linewise read from stdin for events. It will get three lines in succession. The first is the event type, the second two are arguments.
+    or (useful for debugging):
 
-It first gets ("url", "", "", ""), then ("<primary|secondary|something else>", "possible argument", "url of open buffer", "contents of line event was executed on")
+    nvim --listen /my/path.sock
+    nvimtui --socket /my/path.sock ./handler.py
 
-The handler should return the action it wants to perform, then 0 or more arguments then '.END.' (without quotes) to indicate the end of its response.
-Available actions shown in the program.
+handler.py will receive events from neovim on stdin. These will be formatted as line-delimited JSON. The handler should return a JSON array of actions.
 
-As an example, the following is a simple file system browser handler script:
-
-    #!/bin/sh
-    event=""
-    arg1=""
-    arg2=""
-    arg3=""
-    pos=0
-
-    while read -r line;do
-        if [ $pos -eq 0 ];then
-            event="$line"
-        elif [ $pos -eq 1 ];then
-            arg1="$line"
-        elif [ $pos -eq 2 ];then
-            arg2="$line"
-        else
-            arg3="$line"
-        fi
-        pos=$(echo "($pos + 1) % 4" | bc)
-        if [ ! $pos -eq 0 ];then
-            continue
-        fi
-
-        if [ "$event" = "url" ];then
-            echo "setbuffer"
-            echo "text 1"
-            if [ x"$arg1" = x"" ];then
-                arg1="/"
-            fi
-            if [ -d "$arg1" ];then
-                find "$arg1" -maxdepth 1
-            else
-                cat $arg1
-            fi
-        elif [ "$event" = "primary" ];then
-            echo "seturl"
-            echo "$arg3" | awk '{$1=$2="";print $0}'
-        fi
-        echo ".END."
-    done
+Run `nvimtui ./example-script.sh` for an example.
 """
 
+import argparse
+import json
+import logging
 import os
+import select
 import subprocess
 import sys
+import tempfile
 import time
-import threading
+from typing import Optional
 from fcntl import fcntl, F_GETFL, F_SETFL
-from os import O_NONBLOCK, read
+from os import O_NONBLOCK
 
 import pynvim
 
 
 URL_PREFIX = "nvimtui://"
-
-
-def user_log(con, message):
-    con.command(f"echo 'Nvimtui: {message}'")
+logger = logging.getLogger(__name__)
 
 
 def calculate_url(con):
@@ -80,43 +42,146 @@ def calculate_url(con):
         return result
 
 
+def kitty_cmd(cmd, *args):
+    result = subprocess.run(
+        ["kitty", "@", cmd, *args],
+        capture_output=True,
+        check=True
+    )
+    return result.stdout
+
+
+def preview_ensure_window_exists(handle: Optional[str]) -> str:
+    """
+    Pop open a window to show rendered images
+    """
+
+    if preview_window_handle_valid(handle):
+        return handle
+    else:
+        curr_window_id = [
+            window["id"]
+            for os_window in json.loads(kitty_cmd("ls"))
+            for tab in os_window["tabs"]
+            for window in tab["windows"]
+            if tab["is_active"] and window["is_focused"]
+        ][0]
+        photo_window_id = kitty_cmd(
+            "launch",
+            "bash",
+            "-c",
+            "while read -s file;do tpreview \"$file\" --place $(tput cols)x$(tput lines)@0x0 --image-id=1;done"
+        ).decode()
+        kitty_cmd("focus-window", "--match", f"id:{curr_window_id}")
+        return photo_window_id.strip()
+
+
+def preview_window_handle_valid(handle: Optional[str]) -> bool:
+    """
+    Does the given preview window still exist?
+    """
+
+    if handle is None:
+        return False
+
+    return handle in [
+        str(window["id"])
+        for os_window in json.loads(kitty_cmd("ls"))
+        for tab in os_window["tabs"]
+        for window in tab["windows"]
+    ]
+
+
+def preview_view_file(handle: str, filepath: str):
+    """
+    Shows the given file in the preview window
+    """
+
+    kitty_cmd(
+        "send-text",
+        "--match",
+        f"id:{handle}",
+        filepath + "\n"
+    )
+
+
+def preview_close_window(handle: Optional[str]):
+    if handle is not None:
+        kitty_cmd(
+          "close-window",
+          "--match",
+          f"id:{handle}"
+        )
+
+
 def handle_nvim_action(proc, con, args, state):
-    user_log(con, "Calling subprocess")
+    """
+    Ask the process what to do in response to something that happens in nvim.
+    """
+
     try:
-        proc.stdin.write("\n".join(args) + "\n")
+        proc.stdin.write(json.dumps(args) + "\n")
     except BrokenPipeError:
-        user_log(con, "Subprocess closed unexpectedly\n" + proc.stderr.read())
-        return
+        logger.error("Subprocess closed unexpectedly")
+        return False
 
-    args = []
-    while True:
-        line = proc.stdout.readline().strip()
-        if line == ".END.":
+    line = ""
+    stderr = ""
+    while ("\n" not in line and proc.poll() is None):
+        try:
+            ready, _, _ = select.select([proc.stdout, proc.stderr], [], [], 1)
+        except KeyboardInterrupt:
+            proc.kill()
+            proc.wait()
+            return False
             break
-        args.append(line)
+        if proc.stderr in ready:
+            err = proc.stderr.read()
+            sys.stderr.write(err)
+            stderr += err
+        if proc.stdout in ready:
+            newline = False
+            while c := proc.stdout.read(1):
+                if c == "\n":
+                    newline = True
+                    break
+                else:
+                    line += c
+            if newline:
+                break
 
-    error_output = b""
-    try:
-        while True:
-            # Load up any error output
-            error_output += read(proc.stderr.fileno(), 1024)
-    except OSError:
-        if len(error_output) > 0:
-            con.lua.print(error_output.decode())
-            user_log(con, "Error running subprocess, :messages for more")
-        else:
-            # This seems to be how you clear the statusline
-            con.command("echo ''")
+    maybe_returncode = proc.poll()
+    if maybe_returncode is None:
+        try:
+            args = json.loads(line)
+        except json.decoder.JSONDecodeError:
+            print("Error decoding program output, got:", file=sys.stderr)
+            print(line, file=sys.stderr)
+            return False
 
-    if len(args) == 0:
-        return
+        for action in args["actions"]:
+            handle_script_action(
+                proc,
+                con,
+                action["action"],
+                action["args"],
+                state
+            )
+        return True
+    elif maybe_returncode == 0:
+        logger.info("Backing process exited normally")
+        return False
+    else:
+        stderr += proc.stderr.read()
+        logger.error(f"Backing process exited with errors: {stderr}")
+        return False
 
-    action, *action_args = args
 
-    handle_action(proc, con, action, action_args, state)
+def handle_script_action(proc, con, action, action_args, state):
+    """
+    Update Neovim based on the commands the script has sent
+    """
 
-
-def handle_action(proc, con, action, action_args, state):
     target_window = state["window"]
     try:
         target_buffer = con.call("nvim_win_get_buf", target_window)
@@ -164,12 +229,18 @@ def handle_action(proc, con, action, action_args, state):
         #                 ]
         #             )
 
-
     if action == "setbuffer":
         buf_properties = action_args[0].split(" ")
 
         set_opt("modifiable", True)
-        con.call("nvim_buf_set_lines", target_buffer, 0, -1, False, action_args[1:])
+        con.call(
+            "nvim_buf_set_lines",
+            target_buffer,
+            0,
+            -1,
+            False,
+            action_args[1].split("\n")
+        )
         set_opt("modified", False)
         if len(buf_properties) > 0 and buf_properties[0] != "":
             set_opt("filetype", buf_properties[0])
@@ -177,7 +248,11 @@ def handle_action(proc, con, action, action_args, state):
             if buf_properties[1] == "false":
                 set_opt("modifiable", False)
         if len(buf_properties) > 2:
-            con.call("nvim_win_set_cursor", target_window, [int(buf_properties[2]), 0])
+            con.call(
+                "nvim_win_set_cursor",
+                target_window,
+                [int(buf_properties[2]), 0]
+            )
     elif action == "seturl":
         edit_file(URL_PREFIX + action_args[0])
         set_opt("swapfile", False)
@@ -185,23 +260,41 @@ def handle_action(proc, con, action, action_args, state):
         handle_nvim_action(
             proc,
             con,
-            ["url", action_args[0], calculate_url(con), ""],
+            {
+                "action": "url",
+                "args": [action_args[0]],
+                "url": calculate_url(con)
+            },
             state
         )
     elif action == "setrawurl":
         edit_file(action_args[0])
         set_opt("swapfile", False)
         set_opt("modified", False)
+    elif action == "lua_function":
+        con.exec_lua(
+            *action_args
+        )
+    elif action == "preview_file":
+        state["preview_handle"] = preview_ensure_window_exists(state.get("preview_handle"))
+        preview_view_file(state["preview_handle"], action_args[0])
     elif action == "noop":
         pass
 
 
-def rpc_handler(socket_path):
+def rpc_handler(socket_path, script_path, script_args) -> int:
     con = pynvim.attach("socket", path=socket_path)
+
+    class VimLoggingHandler(logging.Handler):
+        def emit(self, record):
+            con.lua.print(f"Nvimtui: {record.message}")
+
+    logger.addHandler(VimLoggingHandler())
+
     con.subscribe("NvimTuiEvent")
 
     handler_proc = subprocess.Popen(
-        sys.argv[1:],
+        [script_path, *script_args],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -213,19 +306,27 @@ def rpc_handler(socket_path):
         F_SETFL,
         fcntl(handler_proc.stderr, F_GETFL) | O_NONBLOCK
     )
-
     state = {
         "window": 0,
     }
 
     con.command(f"edit {URL_PREFIX}")
     con.command("set noswapfile")
-    handle_nvim_action(
+    # Clear the statusline too, nice when debugging to see if there are errors
+    con.command("echo ''")
+    should_continue = handle_nvim_action(
         handler_proc,
         con,
-        ["url", "", calculate_url(con), ""],
+        {
+            "action": "url",
+            "args": [""],
+            "url": calculate_url(con)
+        },
         state
     )
+    if not should_continue:
+        preview_close_window(state["preview_handle"])
+        return 1
 
     try:
         while True:
@@ -236,31 +337,54 @@ def rpc_handler(socket_path):
             event_type, *event_args = msg.args
 
             if event_type == "UserAction":
-                rpc_user_action(
+                should_continue = rpc_user_action(
                     handler_proc,
                     con,
                     event_args[0],
                     event_args[1] if len(event_args) > 1 else "",
                     state
                 )
+                if not should_continue:
+                    # The backing process exited, close nvimtui
+                    preview_close_window(state["preview_handle"])
+                    return 1
             elif event_type == "SetTargetWindow":
                 sys.stderr.write(f"{event_args}")
                 state["window"] = event_args[0]
 
     except EOFError:
-        # Exit, neovim is closed
-        pass
+        # Exit, neovim is closed, but give the backing process a
+        # chance to cleanup first
+        handle_nvim_action(
+            handler_proc,
+            con,
+            {
+                "action": "shutdown",
+                "args": [],
+                "url": "",
+            },
+            state
+        )
+    preview_close_window(state["preview_handle"])
+    return 0
 
 
-def rpc_user_action(handler_proc, con, event_name, event_arg, state):
+def rpc_user_action(
+    handler_proc,
+    con,
+    event_name: str,
+    event_arg: str,
+    state: dict
+) -> bool:
     line_number = con.call("line", ".")
     column_number = con.call("col", ".")
     curr_mode = con.call("mode")
     if curr_mode == "n":
         # In normal mode just grab the line under the current cursor
-        line = con.call("getline", ".").rstrip()
+        selection = con.call("getline", ".").rstrip()
     else:
-        # In visual mode, grab the selected text and separate lines by \n (not the newline char, but the encoding thereof).
+        # In visual mode, grab the selected text and separate lines by \n
+        # (not the newline char, but the encoding thereof).
 
         # These getpos calls return start and end cursor positions, not
         # the start and end of the text range
@@ -283,39 +407,80 @@ def rpc_user_action(handler_proc, con, event_name, event_arg, state):
         else:
             lines[0] = lines[0][start_col-1:]
             lines[-1] = lines[-1][:end_col]
-        line = "\\n".join([l.rstrip() for l in lines])
+        selection = "\\n".join([line.rstrip() for line in lines])
 
-    handle_nvim_action(
+    buffer_number = con.call("bufnr")
+    return handle_nvim_action(
         handler_proc,
         con,
-        [event_name, event_arg, calculate_url(con), f"{line_number} {column_number} {line}",],
+        {
+            "action": event_name,
+            "args": [event_arg],
+            "url": calculate_url(con),
+            "buffer_number": buffer_number,
+            "line_number": line_number,
+            "column_number": column_number,
+            "selection_text": selection
+        },
         state
     )
 
 
 def spawn_nvim():
-    socket_path = "/tmp/nvim.sock"
-    proc = subprocess.Popen(
-        ["nvim", "--listen", socket_path, "-c", "NvimTuiEnable", "-c", "set nomodified", "-c", "lua vim.o.title=true ; vim.o.titlestring='NvimTui'"],
+    socket_path = tempfile.mktemp(prefix="nvimtui_")
+    subprocess.Popen(
+        [
+            "nvim",
+            "--listen",
+            socket_path,
+            "-c",
+            "NvimTui start",
+            "-c",
+            "set nomodified",
+            "-c",
+            "lua vim.o.title=true ; vim.o.titlestring='NvimTui'"
+        ],
         stdin=sys.stdin,
         stdout=sys.stdout,
         stderr=sys.stderr
     )
     for _ in range(50):
         if os.path.exists(socket_path):
-            return proc, socket_path
+            return socket_path
         time.sleep(0.1)
 
     raise RuntimeError("Didn't find nvim socket")
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: nvimtui <handler_script.sh>")
+    parser = argparse.ArgumentParser(
+        description=globals()["__doc__"]
+    )
+    parser.add_argument("script", help="Script to run")
+    parser.add_argument("args", nargs="*", help="Arguments to script")
+    parser.add_argument(
+        "--socket",
+        help="Don't spawn a new nvim instance, use this existing socket"
+    )
+    args = parser.parse_args()
+    if not args.script:
+        parser.print_usage()
         sys.exit(1)
-    proc, socket_path = spawn_nvim()
-    threading.Thread(target=rpc_handler, args=[socket_path], daemon=False).run()
-    proc.wait()
+
+    logger.setLevel(logging.DEBUG)
+
+    socket = args.socket
+    if args.socket is None:
+        socket = spawn_nvim()
+    else:
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s"
+        )
+        console_handler.setFormatter(console_formatter)
+        logger.addHandler(console_handler)
+
+    sys.exit(rpc_handler(socket, args.script, args.args))
 
 
 if __name__ == "__main__":
