@@ -1,4 +1,5 @@
 #!/bin/sh
 
-python=$(poetry -C $(dirname $0) run which python)
-$python -u $(dirname $0)/nvimtui.py $@
+dir=$(dirname $(readlink -f $0))
+python=$(poetry -C "$dir" run which python)
+$python -u "$dir/nvimtui.py" $@

@@ -325,7 +325,7 @@ def rpc_handler(socket_path, script_path, script_args) -> int:
         state
     )
     if not should_continue:
-        preview_close_window(state["preview_handle"])
+        preview_close_window(state.get("preview_handle"))
         return 1
 
     try:
@@ -346,7 +346,7 @@ def rpc_handler(socket_path, script_path, script_args) -> int:
                 )
                 if not should_continue:
                     # The backing process exited, close nvimtui
-                    preview_close_window(state["preview_handle"])
+                    preview_close_window(state.get("preview_handle"))
                     return 1
             elif event_type == "SetTargetWindow":
                 sys.stderr.write(f"{event_args}")
@@ -365,7 +365,7 @@ def rpc_handler(socket_path, script_path, script_args) -> int:
             },
             state
         )
-    preview_close_window(state["preview_handle"])
+    preview_close_window(state.get("preview_handle"))
     return 0
 
 
