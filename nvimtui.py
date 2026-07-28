@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 """
 Use NeoVim as a simple TUI with the help of a handler script.
 
