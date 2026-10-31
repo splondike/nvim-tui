@@ -70,6 +70,7 @@ def preview_ensure_window_exists(handle: Optional[str]) -> str:
         ][0]
         photo_window_id = kitty_cmd(
             "launch",
+            "--cwd=current",
             "bash",
             "-c",
             "while read -s file;do tpreview \"$file\" --place $(tput cols)x$(tput lines)@0x0 --image-id=1;done"
